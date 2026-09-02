@@ -5,11 +5,25 @@
 
 An experimental [Hermes Agent](https://github.com/NousResearch/hermes-agent) platform plugin that turns a Meshtastic radio into a direct-message channel for Hermes.
 
+<p align="center">
+  <img src="assets/hermes-plus-heltec-v4.webp" alt="Hermes Agent plus a Heltec V4 Meshtastic radio" width="100%">
+</p>
+
 ```text
 remote Meshtastic node ⇄ LoRa mesh ⇄ USB radio ⇄ Hermes Gateway
 ```
 
 > **Status:** experimental v0.1. The adapter has been exercised on Linux with two Heltec V4 nodes and Meshtastic 2.8. It should work with other devices that expose the Meshtastic serial API, but broader hardware testing is welcome.
+
+## In action
+
+A real direct-message exchange with Hermes through the Meshtastic mobile app:
+
+<p align="center">
+  <img src="assets/meshtastic-hermes-chat.jpg" alt="Chatting with Hermes through the Meshtastic mobile app" width="360">
+</p>
+
+The message travels from the phone-connected node over LoRa to the USB radio attached to Hermes; the reply returns through the same route.
 
 ## Features
 
