@@ -2,8 +2,33 @@
 name = "hermes-meshtastic-adapter"
 version = "0.1.0"
 description = "Hotplug-capable Meshtastic platform adapter for Hermes Agent"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Kotelnikov Andrew" }]
+keywords = ["hermes-agent", "meshtastic", "lora", "gateway", "hotplug"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
 dependencies = ["meshtastic>=2.7,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[project.urls]
+Homepage = "https://github.com/AndrewKotelnikov1992/hermes-meshtastic-adapter"
+Issues = "https://github.com/AndrewKotelnikov1992/hermes-meshtastic-adapter/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

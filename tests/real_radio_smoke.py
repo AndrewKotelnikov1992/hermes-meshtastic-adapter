@@ -1,9 +1,11 @@
 """Real-radio smoke test for the Meshtastic Hermes adapter."""
 
+import argparse
 import asyncio
 from types import SimpleNamespace
 
 from gateway.platform_registry import PlatformEntry, platform_registry
+
 from adapter import MeshtasticAdapter
 
 platform_registry.register(
@@ -16,13 +18,23 @@ platform_registry.register(
 )
 
 
-async def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--remote-node", required=True, help="DM destination, e.g. !87654321")
+    parser.add_argument("--device", default="", help="Serial device; omit for auto-discovery")
+    parser.add_argument("--local-node", default="", help="Optional expected local node ID")
+    parser.add_argument("--local-short-name", default="", help="Optional expected short name")
+    parser.add_argument("--message", default="Hermes Meshtastic adapter smoke test")
+    return parser.parse_args()
+
+
+async def main(args):
     cfg = SimpleNamespace(
         extra={
-            "device_glob": "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*-if00",
-            "expected_node_id": "!e786199c",
-            "expected_short_name": "ak04",
-            "allow_from": ["!f11a8e29"],
+            "device": args.device,
+            "expected_node_id": args.local_node,
+            "expected_short_name": args.local_short_name,
+            "allow_from": [args.remote_node],
             "reconnect_seconds": 1,
             "serial_timeout_seconds": 20,
             "max_payload_bytes": 180,
@@ -37,10 +49,8 @@ async def main():
                 break
             await asyncio.sleep(1)
         assert adapter._interface is not None, "radio did not connect"
-        info = await adapter.get_chat_info("!f11a8e29")
-        result = await adapter.send(
-            "!f11a8e29", "Hermes gateway adapter: реальный smoke test пройден"
-        )
+        info = await adapter.get_chat_info(args.remote_node)
+        result = await adapter.send(args.remote_node, args.message)
         print({
             "radio_path": adapter._interface_path,
             "remote": info,
@@ -54,4 +64,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(parse_args()))

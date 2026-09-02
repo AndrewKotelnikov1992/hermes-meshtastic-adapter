@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections import deque
-from datetime import datetime
 import glob
 import logging
-from pathlib import Path
+import os
 import re
 import threading
 import time
-from typing import Any, Iterable, Optional
+from collections import deque
+from collections.abc import Iterable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 from gateway.config import Platform
 from gateway.platforms.base import (
@@ -24,9 +26,12 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DEVICE_GLOB = (
-    "/dev/serial/by-id/"
-    "usb-Espressif_USB_JTAG_serial_debug_unit_*-if00"
+DEFAULT_DEVICE_GLOBS = (
+    "/dev/serial/by-id/*",
+    "/dev/ttyACM*",
+    "/dev/ttyUSB*",
+    "/dev/cu.usbmodem*",
+    "/dev/cu.usbserial*",
 )
 
 
@@ -114,7 +119,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("meshtastic"))
         extra = getattr(config, "extra", {}) or {}
 
-        self.device_glob = str(extra.get("device_glob") or DEFAULT_DEVICE_GLOB)
+        self.device = str(extra.get("device") or "").strip()
+        self.device_glob = str(extra.get("device_glob") or "").strip()
         self.expected_node_id = _normalize_node_id(extra.get("expected_node_id"))
         self.expected_short_name = str(extra.get("expected_short_name") or "").strip()
         raw_allow = extra.get("allow_from") or []
@@ -135,12 +141,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
             raise ValueError("max_payload_bytes must be between 32 and 220")
         self.want_ack = bool(extra.get("want_ack", True))
 
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._supervisor_task: Optional[asyncio.Task] = None
-        self._radio_lost: Optional[asyncio.Event] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._supervisor_task: asyncio.Task | None = None
+        self._radio_lost: asyncio.Event | None = None
         self._interface: Any = None
         self._interface_path = ""
         self._interface_lock = threading.RLock()
+        self._opening_tasks: set[asyncio.Task] = set()
+        self._cleanup_tasks: set[asyncio.Task] = set()
         self._stopping = False
         self._subscribed = False
         self._seen_packet_ids: set[str] = set()
@@ -171,8 +179,9 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # presence is managed internally so unplugging never restarts Hermes.
         self._mark_connected()
         logger.info(
-            "Meshtastic: hotplug supervisor started (glob=%s, allow_from=%s)",
-            self.device_glob,
+            "Meshtastic: hotplug supervisor started (device=%s, glob=%s, allow_from=%s)",
+            self.device or "auto",
+            self.device_glob or "auto",
             sorted(self.allowed_nodes),
         )
         return True
@@ -188,6 +197,14 @@ class MeshtasticAdapter(BasePlatformAdapter):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        # SerialInterface construction is blocking and runs in a worker thread.
+        # Drain any open that completed after supervisor cancellation, then wait
+        # for its close operation before allowing the event loop to shut down.
+        if self._opening_tasks:
+            await asyncio.gather(*tuple(self._opening_tasks), return_exceptions=True)
+            await asyncio.sleep(0)  # Let completion callbacks schedule closes.
+        if self._cleanup_tasks:
+            await asyncio.gather(*tuple(self._cleanup_tasks), return_exceptions=True)
         await self._close_radio()
         self._unsubscribe()
         logger.info("Meshtastic: adapter stopped")
@@ -213,36 +230,67 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._subscribed = False
 
     def _candidate_paths(self) -> Iterable[str]:
-        for path in sorted(glob.glob(self.device_glob)):
-            if Path(path).exists():
+        """Yield unique serial candidates, preferring stable by-id paths."""
+        candidates: list[str] = []
+        if self.device:
+            candidates.append(self.device)
+        elif self.device_glob:
+            candidates.extend(sorted(glob.glob(self.device_glob)))
+        else:
+            for pattern in DEFAULT_DEVICE_GLOBS:
+                candidates.extend(sorted(glob.glob(pattern)))
+            try:
+                from serial.tools import list_ports
+
+                candidates.extend(
+                    port.device
+                    for port in list_ports.comports()
+                    if os.name == "nt"
+                    or getattr(port, "vid", None) is not None
+                    or "usb" in port.device.lower()
+                )
+            except Exception as exc:
+                logger.debug("Meshtastic: serial port enumeration failed: %s", exc)
+
+        seen: set[str] = set()
+        for path in candidates:
+            if not path:
+                continue
+            # Resolve Linux/macOS symlinks so /dev/serial/by-id and /dev/ttyACM
+            # aliases do not cause the same radio to be opened twice. Keep COM
+            # names intact on Windows, where Path.exists() is not meaningful.
+            identity = os.path.realpath(path) if os.name != "nt" else path.upper()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if os.name == "nt" or Path(path).exists():
                 yield path
+
+    async def _connect_first_available(self) -> bool:
+        """Try every candidate once, rather than retrying a wrong first port."""
+        for path in self._candidate_paths():
+            if self._stopping:
+                return False
+            if await self._open_radio(path):
+                return True
+        return False
 
     async def _hotplug_supervisor(self) -> None:
         while not self._stopping:
             try:
                 if self._interface is None:
-                    path = next(iter(self._candidate_paths()), "")
-                    if not path:
+                    connected = await self._connect_first_available()
+                    if not connected:
                         await asyncio.sleep(self.reconnect_seconds)
-                        continue
-                    await self._open_radio(path)
                     continue
 
                 assert self._radio_lost is not None
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         self._radio_lost.wait(), timeout=self.reconnect_seconds
                     )
-                except asyncio.TimeoutError:
-                    pass
 
-                interface = self._interface
-                connected = bool(
-                    interface is not None
-                    and getattr(interface, "isConnected", None) is not None
-                    and interface.isConnected.is_set()
-                    and Path(self._interface_path).exists()
-                )
+                connected = self._radio_is_connected()
                 if self._radio_lost.is_set() or not connected:
                     self._radio_lost.clear()
                     await self._close_radio()
@@ -253,32 +301,64 @@ class MeshtasticAdapter(BasePlatformAdapter):
                 await self._close_radio()
                 await asyncio.sleep(self.reconnect_seconds)
 
-    async def _open_radio(self, path: str) -> None:
+    def _radio_is_connected(self) -> bool:
+        interface = self._interface
+        path_present = os.name == "nt" or Path(self._interface_path).exists()
+        return bool(
+            interface is not None
+            and getattr(interface, "isConnected", None) is not None
+            and interface.isConnected.is_set()
+            and path_present
+        )
+
+    async def _open_radio(self, path: str) -> bool:
         logger.info("Meshtastic: detected %s; connecting", path)
+        open_task = asyncio.create_task(
+            asyncio.to_thread(self._create_interface, path),
+            name=f"meshtastic-open:{path}",
+        )
+        self._opening_tasks.add(open_task)
         try:
-            interface = await asyncio.to_thread(self._create_interface, path)
+            # Shield the worker so cancellation cannot abandon a serial interface
+            # that finishes opening after adapter shutdown.
+            interface = await asyncio.shield(open_task)
         except asyncio.CancelledError:
+            open_task.add_done_callback(self._close_late_interface)
             raise
         except Exception as exc:
+            self._opening_tasks.discard(open_task)
             logger.warning("Meshtastic: connection to %s failed: %s", path, exc)
-            await asyncio.sleep(self.reconnect_seconds)
-            return
+            return False
+        self._opening_tasks.discard(open_task)
 
-        local_num = int(interface.myInfo.my_node_num)
-        local_id = _normalize_node_id(local_num)
-        local_user = _node_user(interface, local_id)
-        short_name = str(local_user.get("shortName") or "")
+        if self._stopping:
+            await asyncio.to_thread(self._safe_close, interface)
+            return False
 
-        mismatch = ""
-        if self.expected_node_id and local_id != self.expected_node_id:
-            mismatch = f"node id {local_id}, expected {self.expected_node_id}"
-        elif self.expected_short_name and short_name != self.expected_short_name:
-            mismatch = f"short name {short_name!r}, expected {self.expected_short_name!r}"
+        try:
+            my_info = getattr(interface, "myInfo", None)
+            if my_info is None:
+                raise ValueError("device did not provide Meshtastic node information")
+            local_num = int(my_info.my_node_num)
+            local_id = _normalize_node_id(local_num)
+            local_user = _node_user(interface, local_id)
+            short_name = str(local_user.get("shortName") or "")
+
+            mismatch = ""
+            if self.expected_node_id and local_id != self.expected_node_id:
+                mismatch = f"node id {local_id}, expected {self.expected_node_id}"
+            elif self.expected_short_name and short_name != self.expected_short_name:
+                mismatch = (
+                    f"short name {short_name!r}, expected {self.expected_short_name!r}"
+                )
+        except Exception as exc:
+            logger.warning("Meshtastic: rejecting non-Meshtastic port %s: %s", path, exc)
+            await asyncio.to_thread(self._safe_close, interface)
+            return False
         if mismatch:
             logger.warning("Meshtastic: rejecting %s: %s", path, mismatch)
             await asyncio.to_thread(self._safe_close, interface)
-            await asyncio.sleep(self.reconnect_seconds)
-            return
+            return False
 
         with self._interface_lock:
             self._interface = interface
@@ -288,6 +368,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
         logger.info(
             "Meshtastic: radio connected: %s (%s, %s)", short_name, local_id, path
         )
+        return True
+
+    def _close_late_interface(self, task: asyncio.Task) -> None:
+        """Close a radio whose blocking open completed after cancellation."""
+        self._opening_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            interface = task.result()
+        except Exception:
+            return
+        cleanup = asyncio.create_task(asyncio.to_thread(self._safe_close, interface))
+        self._cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._cleanup_tasks.discard)
 
     def _create_interface(self, path: str):
         from meshtastic.serial_interface import SerialInterface
@@ -416,8 +510,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         del reply_to, metadata
         destination = _normalize_node_id(chat_id)
