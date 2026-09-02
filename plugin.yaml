@@ -1,0 +1,6 @@
+name: meshtastic-platform
+label: Meshtastic
+kind: platform
+version: 0.1.0
+description: Hotplug-capable Meshtastic serial gateway adapter for Hermes Agent
+author: Andrew Kotelnikov + Hermes Agent
